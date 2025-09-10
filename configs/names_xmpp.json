@@ -1,0 +1,10 @@
+{
+  "type": "names",
+  "config": {
+    "A": "a@homelab.fortiguate.com",
+    "B": "b@homelab.fortiguate.com",
+    "C": "c@homelab.fortiguate.com",
+    "D": "d@homelab.fortiguate.com",
+    "E": "e@homelab.fortiguate.com"
+  }
+}
