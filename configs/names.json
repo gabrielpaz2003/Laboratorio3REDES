@@ -1,15 +1,7 @@
 {
   "type": "names",
   "config": {
-    "N1":  "sec30.grupo1.nodo1",
-    "N2":  "sec30.grupo2.nodo2",
-    "N3":  "sec30.grupo3.nodo3",
-    "N4":  "sec30.grupo4.nodo4",
-    "N5":  "sec30.grupo5.nodo5",
     "N6":  "sec30.grupo6.nodo6",
-    "N7":  "sec30.grupo7.nodo7",
-    "N8":  "sec30.grupo8.nodo8",
-    "N9":  "sec30.grupo9.nodo9",
     "N10": "sec30.grupo10.nodo10",
     "N11": "sec30.grupo11.nodo11"
   }

@@ -29,11 +29,6 @@ def _load_json(path: str) -> Dict[str, Any]:
 class Node:
     """
     Nodo con transporte Redis/XMPP y servicios de Forwarding + (LSR|DVR|Dijkstra|Flooding).
-
-    Lee .env:
-      - REDIS_*  o  XMPP_* (según TRANSPORT)
-      - SECTION, TOPO, NODE, NAMES_PATH, TOPO_PATH
-      - PROTO = lsr|dvr|dijkstra|flooding
     """
 
     def __init__(self, env_path: Optional[str] = None) -> None:
@@ -84,10 +79,11 @@ class Node:
         self.dijk: Optional[RoutingDijkstraStaticService] = None
 
         # ── Configs cargadas ─────────────────────────────────────────────────
-        self.names_cfg: Dict[str, str] = {}       # node_id -> canal/JID
-        self.topo_cfg: Dict[str, List[str]] = {}  # node_id -> [neighbors]
+        self.names_cfg: Dict[str, str] = {}          # node_id -> canal/JID
+        self.topo_cfg: Dict[str, Any] = {}           # node_id -> [neighbors] | {neighbor: weight}
         self.neighbor_ids: List[str] = []
-        self.neighbor_map: Dict[str, str] = {}    # neighbor_id -> canal/JID
+        self.neighbor_map: Dict[str, str] = {}       # neighbor_id -> canal/JID
+        self.neighbor_weights: Dict[str, float] = {} # neighbor_id -> weight
 
         # ── Tasks locales ───────────────────────────────────────────────────
         self._hello_task: Optional[asyncio.Task] = None
@@ -98,43 +94,60 @@ class Node:
         ch = self.names_cfg.get(self.my_id)
         if ch:
             return ch
-        # fallback Redis
         return f"{self.section}.{self.topo_id}.{self.my_id}"
 
+    @staticmethod
+    def _normalize_neighbor_weights(raw: Any) -> Dict[str, float]:
+        """Acepta lista (peso 1.0) o dict {vecino:peso} (>0)."""
+        weights: Dict[str, float] = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                w = float(v)
+                if w <= 0:
+                    raise ValueError(f"Peso inválido (<=0) para '{k}': {w}")
+                weights[k] = w
+        elif isinstance(raw, (list, tuple)):
+            for k in raw:
+                weights[str(k)] = 1.0
+        else:
+            raise ValueError("topo.json inválido: cada entrada debe ser lista o dict de pesos")
+        return weights
+
     def _load_configs(self) -> None:
-        """Carga names.json y topo.json, mapeando vecinos y canales/JIDs."""
         names = _load_json(self.names_path)
         topo = _load_json(self.topo_path)
 
-        # Validaciones básicas
         if names.get("type") != "names" or "config" not in names:
             raise ValueError("names.json inválido: falta {type:'names', config:{...}}")
         if topo.get("type") != "topo" or "config" not in topo:
             raise ValueError("topo.json inválido: falta {type:'topo', config:{...}}")
 
-        # Carga de configuraciones
         self.names_cfg = dict(names["config"])
         self.topo_cfg = dict(topo["config"])
 
-        # Vecinos del nodo
-        self.neighbor_ids = list(self.topo_cfg.get(self.my_id, []))
-        self.neighbor_map = {nid: self.names_cfg[nid] for nid in self.neighbor_ids if nid in self.names_cfg}
+        raw_neighbors = self.topo_cfg.get(self.my_id, [])
+        self.neighbor_weights = self._normalize_neighbor_weights(raw_neighbors)
+        self.neighbor_ids = list(self.neighbor_weights.keys())
+
+        self.neighbor_map = {
+            nid: self.names_cfg[nid]
+            for nid in self.neighbor_ids
+            if nid in self.names_cfg
+        }
 
         if not self.neighbor_map:
             self.log.warning("Este nodo no tiene vecinos mapeados en names.json/topo.json")
 
         self.log.info(f"Vecinos de {self.my_id}: {self.neighbor_ids}")
+        self.log.info(f"Pesos de enlaces: {self.neighbor_weights}")
         self.log.info(f"Canal propio: {self._my_channel()}")
         self.log.info(f"PROTO en uso: {self.proto}")
         self.log.info(f"TRANSPORT en uso: {self.transport_kind}")
 
     async def _bootstrap_services(self) -> None:
-        """Inicializa state, transporte, servicios de ruteo y forwarding."""
-        # Estado inicial: vecinos directos con costo 1.0
         self.state = State(node_id=self.my_id)
-        await self.state.set_neighbors([(n, 1.0) for n in self.neighbor_ids])
+        await self.state.set_neighbors(list(self.neighbor_weights.items()))
 
-        # Transporte
         if self.transport_kind == "xmpp":
             self.transport = XmppTransport(
                 jid=self.xmpp_jid,
@@ -153,7 +166,6 @@ class Node:
 
         await self.transport.connect()
 
-        # Servicios de ruteo según PROTO
         on_info_cb = None
 
         if self.proto == "lsr":
@@ -190,14 +202,22 @@ class Node:
             on_info_cb = self.dvr.on_info
 
         elif self.proto == "dijkstra":
+            topo_neighbors_only: Dict[str, List[str]] = {}
+            for nid, raw in self.topo_cfg.items():
+                if isinstance(raw, dict):
+                    topo_neighbors_only[nid] = list(raw.keys())
+                elif isinstance(raw, (list, tuple)):
+                    topo_neighbors_only[nid] = list(map(str, raw))
+                else:
+                    topo_neighbors_only[nid] = []
             self.dijk = RoutingDijkstraStaticService(
                 state=self.state,
                 my_id=self.my_id,
-                topo_config=self.topo_cfg,
+                topo_config=topo_neighbors_only,
                 logger_name=f"DIJK-{self.my_id}",
             )
             await self.dijk.start()
-            on_info_cb = None  # no necesita INFO
+            on_info_cb = None
 
         elif self.proto == "flooding":
             on_info_cb = None
@@ -205,7 +225,6 @@ class Node:
         else:
             raise ValueError(f"PROTO desconocido: {self.proto}")
 
-        # Forwarding
         self.forwarding = ForwardingService(
             state=self.state,
             transport=self.transport,
@@ -218,25 +237,18 @@ class Node:
         )
         await self.forwarding.start()
 
-        # HELLO/INFO iniciales
         await self._emit_initial_control_packets()
-
-        # HELLO periódico
         self._hello_task = asyncio.create_task(self._periodic_hello())
 
     async def _emit_initial_control_packets(self) -> None:
         assert self.transport is not None
-        # HELLO inicial
         hello = build_hello(self.my_id).to_publish_dict()
         await self.transport.broadcast(self.neighbor_map.values(), hello)
 
-        # INFO inicial (según PROTO)
         if self.proto == "lsr":
-            initial_links = {n: 1.0 for n in self.neighbor_ids}
-            info = build_info(self.my_id, initial_links).to_publish_dict()
+            info = build_info(self.my_id, dict(self.neighbor_weights)).to_publish_dict()
             await self.transport.broadcast(self.neighbor_map.values(), info)
         elif self.proto == "dvr":
-            # DVR anunciará en su start(), pero no estorba mandar 1er anuncio
             pass
 
         self.log.info("Paquetes iniciales enviados")
@@ -284,11 +296,22 @@ class Node:
         self.log.info(f"Nodo {self.my_id} detenido.")
 
     async def send_message(self, dst: str, body: Any = "hola") -> None:
+        """Envía mensaje:
+           1) si dst es vecino directo -> unicast directo
+           2) si hay ruta en tabla -> unicast via next_hop
+           3) si no hay ruta -> flooding a vecinos
+        """
         assert self.transport is not None and self.state is not None
 
         pkt = build_message(self.my_id, dst, body).to_publish_dict()
 
-        # intentar ruta conocida (no aplica a flooding, pero no hace daño)
+        # 1) Envío directo si es vecino inmediato
+        if dst in self.neighbor_map:
+            await self.transport.publish_json(self.neighbor_map[dst], pkt)
+            self.log.info(f"[CLI] MESSAGE {self.my_id}→{dst} via {dst} (direct)")
+            return
+
+        # 2) Intentar ruta conocida (LSR/DVR/Dijkstra)
         next_hop = await self.state.get_next_hop(dst)
         if next_hop:
             ch = self.neighbor_map.get(next_hop)
@@ -297,6 +320,6 @@ class Node:
                 self.log.info(f"[CLI] MESSAGE {self.my_id}→{dst} via {next_hop}")
                 return
 
-        # fallback: flooding controlado
+        # 3) Flooding controlado
         await self.transport.broadcast(self.neighbor_map.values(), pkt)
         self.log.info(f"[CLI] MESSAGE {self.my_id}→{dst}")
