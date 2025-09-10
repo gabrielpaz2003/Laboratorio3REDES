@@ -39,6 +39,9 @@ class ForwardingService:
         self.transport = transport
         self.my_id = my_id
         self.neighbor_map = dict(neighbor_map)  # id -> canal/jid
+        # Mapa inverso para compat: canal -> id (solo los vecinos conocidos)
+        self.neighbor_by_channel: Dict[str, str] = {ch: nid for nid, ch in self.neighbor_map.items()}
+
         self.on_info_async = on_info_async
         self.hello_timeout_sec = hello_timeout_sec
         self.mode = mode
@@ -67,6 +70,56 @@ class ForwardingService:
 
     # ---------------- Internals ----------------
 
+    def _coerce_compat(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Parche de compatibilidad para paquetes de otros equipos:
+          - HELLO con 'to' distinto de 'broadcast' -> forzamos broadcast
+          - headers como lista de dicts -> lista de strings (o vacío)
+          - 'from'/'to' como canales completos -> mapeo a IDs si son vecinos
+        """
+        t = str(data.get("type", "")).lower()
+
+        # Normalización básica de 'from' si viene como canal
+        frm = data.get("from")
+        if isinstance(frm, str) and frm in self.neighbor_by_channel:
+            data["from"] = self.neighbor_by_channel[frm]
+
+        # Normalización de 'to' si viene como canal (aplica más a 'message')
+        to = data.get("to")
+        if isinstance(to, str) and to in self.neighbor_by_channel:
+            data["to"] = self.neighbor_by_channel[to]
+
+        # HELLO: forzar to='broadcast' y headers saneados
+        if t == "hello":
+            if data.get("to") != "broadcast":
+                # Muchos envían HELLO dirigido al canal; lo tratamos como broadcast.
+                data["to"] = "broadcast"
+
+            headers = data.get("headers")
+            if isinstance(headers, list) and headers:
+                # Si mandaron [{'packet_id': '...'}] u otros dicts, vaciamos o convertimos a strings.
+                if isinstance(headers[0], dict):
+                    # Intentar extraer algún identificador; si no, dejamos vacío.
+                    extracted = []
+                    for h in headers:
+                        # posibles claves comunes
+                        for k in ("packet_id", "id", "trace", "hop"):
+                            if isinstance(h, dict) and k in h and isinstance(h[k], str):
+                                extracted.append(h[k])
+                                break
+                    data["headers"] = extracted
+            elif headers is None:
+                data["headers"] = []
+
+            # payload de HELLO suele ser irrelevante; si no es str/dict, lo limpiamos
+            if "payload" in data and not isinstance(data["payload"], (str, dict)):
+                data["payload"] = "hello"
+
+        # INFO/MESSAGE: si 'from' quedó como canal pero no es vecino conocido,
+        # lo dejamos pasar; el schema lo aceptará como str pero no sabremos
+        # mapear a next_hop (no pasa nada grave).
+        return data
+
     async def _run(self) -> None:
         async for raw in self.transport.read_loop():
             if self._stopping.is_set():
@@ -77,6 +130,12 @@ class ForwardingService:
             except Exception:
                 self.log.warning(f"Descartado (JSON inválido): {raw[:120]}…")
                 continue
+
+            # ── Parche de compatibilidad antes de validar con el schema ──
+            try:
+                data = self._coerce_compat(data)
+            except Exception as e:
+                self.log.debug(f"Compat coercion falló: {e}; raw={data}")
 
             try:
                 pkt = PacketFactory.parse_obj(data)
