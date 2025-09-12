@@ -1,6 +1,6 @@
 {
   "type": "topo",
   "config": {
-    "N6": { "N10": 15, "N11": 5 }
+    "sec30.grupo6.nodo6": { "sec30.grupo10.nodo10": 15, "sec30.grupo11.nodo11": 5 }
   }
 }

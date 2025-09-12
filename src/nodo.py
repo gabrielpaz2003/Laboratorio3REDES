@@ -253,15 +253,33 @@ class Node:
 
         self.log.info("Paquetes iniciales enviados")
 
+    # ... (todo igual que tu archivo actual)
+
     async def _periodic_hello(self) -> None:
         assert self.transport is not None
         try:
             while True:
                 await asyncio.sleep(self.hello_interval)
+
+                # 1) HELLO clásico (broadcast)
                 pkt = build_hello(self.my_id).to_publish_dict()
                 await self.transport.broadcast(self.neighbor_map.values(), pkt)
+
+                # 2) HELLO COMPAT por-par (para quienes esperan {type:'hello', from,to,hops})
+                for neigh, w in self.neighbor_weights.items():
+                    compat = {
+                        "proto": "lsr",
+                        "type": "hello",
+                        "from": self.my_id,
+                        "to": neigh,       # otros grupos lo mandan dirigido
+                        "hops": float(w),  # peso del enlace
+                        "ttl": 8,
+                        "headers": [],
+                    }
+                    await self.transport.broadcast(self.neighbor_map.values(), compat)
         except asyncio.CancelledError:
             return
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # API pública

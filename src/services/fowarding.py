@@ -2,9 +2,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from typing import Any, Dict, Callable, Awaitable, Optional, Iterable, Set
+from typing import Any, Dict, Callable, Awaitable, Optional, Set
 
-from src.protocol.schema import PacketFactory, HelloPacket, InfoPacket, UserMessagePacket, BasePacket
+from src.protocol.schema import (
+    PacketFactory, HelloPacket, InfoPacket, UserMessagePacket, BasePacket
+)
 from src.storage.state import State
 from src.transport.redis_transport import RedisTransport
 from src.utils.log import setup_logger
@@ -12,22 +14,17 @@ from src.utils.log import setup_logger
 
 class ForwardingService:
     """
-    Servicio de forwarding (genérico para flooding/lsr/dvr/dijkstra):
-
-      - Lee del canal propio (transport.read_loop)
-      - Parsea, valida y aplica reglas por tipo
-      - Reenvía según TTL, headers (anti-ciclo), routing_table y flooding controlado
-      - Delega actualización de ruteo a on_info_async (LSR/DVR)
-
-    Params clave:
-      mode: "lsr" | "dvr" | "flooding" | "dijkstra"
-      on_info_async: async fn(from_id: str, info_payload: dict) -> None (solo LSR/DVR)
+    Forwarding (flooding/lsr/dvr/dijkstra) + COMPAT:
+      - Acepta mensajes de otros grupos:
+        * HELLO con 'to' distinto de broadcast → se fuerza a 'broadcast'
+        * message {from,to,hops} → se traduce a INFO (LSP) {to: hops}
+      - De-dupe por msg_id, anti-ciclo (headers), TTL decreciente.
     """
 
     def __init__(
         self,
         state: State,
-        transport: RedisTransport,  # interfaz compatible (Redis/XMPP)
+        transport: RedisTransport,
         my_id: str,
         neighbor_map: Dict[str, str],
         on_info_async: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
@@ -39,7 +36,6 @@ class ForwardingService:
         self.transport = transport
         self.my_id = my_id
         self.neighbor_map = dict(neighbor_map)  # id -> canal/jid
-        # Mapa inverso para compat: canal -> id (solo los vecinos conocidos)
         self.neighbor_by_channel: Dict[str, str] = {ch: nid for nid, ch in self.neighbor_map.items()}
 
         self.on_info_async = on_info_async
@@ -47,9 +43,7 @@ class ForwardingService:
         self.mode = mode
         self.log = setup_logger(logger_name or f"FWD-{my_id}")
 
-        # tarea principal
         self._runner_task: Optional[asyncio.Task] = None
-        # control de apagado
         self._stopping = asyncio.Event()
 
     # ---------------- Lifecycle ----------------
@@ -72,66 +66,64 @@ class ForwardingService:
 
     def _coerce_compat(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Parche de compatibilidad para paquetes de otros equipos:
-          - HELLO con 'to' distinto de 'broadcast' -> forzamos broadcast
-          - headers como lista de dicts -> lista de strings (o vacío)
-          - 'from'/'to' como canales completos -> mapeo a IDs si son vecinos
+        Compat con otros grupos:
+          - HELLO con 'to' != broadcast -> forzar broadcast
+          - message {from,to,hops} -> traducir a INFO (LSP) {'to': hops}
+          - Normalizar 'from'/'to' si vienen como canal (solo vecinos)
         """
         t = str(data.get("type", "")).lower()
 
-        # Normalización básica de 'from' si viene como canal
+        # Normalizar IDs si enviaron el canal
         frm = data.get("from")
         if isinstance(frm, str) and frm in self.neighbor_by_channel:
             data["from"] = self.neighbor_by_channel[frm]
-
-        # Normalización de 'to' si viene como canal (aplica más a 'message')
         to = data.get("to")
         if isinstance(to, str) and to in self.neighbor_by_channel:
             data["to"] = self.neighbor_by_channel[to]
 
-        # HELLO: forzar to='broadcast' y headers saneados
+        # HELLO: forzar broadcast y limpiar ruido
         if t == "hello":
             if data.get("to") != "broadcast":
-                # Muchos envían HELLO dirigido al canal; lo tratamos como broadcast.
                 data["to"] = "broadcast"
-
-            headers = data.get("headers")
-            if isinstance(headers, list) and headers:
-                # Si mandaron [{'packet_id': '...'}] u otros dicts, vaciamos o convertimos a strings.
-                if isinstance(headers[0], dict):
-                    # Intentar extraer algún identificador; si no, dejamos vacío.
-                    extracted = []
-                    for h in headers:
-                        # posibles claves comunes
-                        for k in ("packet_id", "id", "trace", "hop"):
-                            if isinstance(h, dict) and k in h and isinstance(h[k], str):
-                                extracted.append(h[k])
-                                break
-                    data["headers"] = extracted
-            elif headers is None:
+            if not isinstance(data.get("headers"), (list, dict)):
                 data["headers"] = []
-
-            # payload de HELLO suele ser irrelevante; si no es str/dict, lo limpiamos
             if "payload" in data and not isinstance(data["payload"], (str, dict)):
                 data["payload"] = "hello"
+            return data
 
-        # INFO/MESSAGE: si 'from' quedó como canal pero no es vecino conocido,
-        # lo dejamos pasar; el schema lo aceptará como str pero no sabremos
-        # mapear a next_hop (no pasa nada grave).
+        # message {from,to,hops} -> INFO (LSP) de 'from'
+        if t == "message":
+            hops = data.get("hops", None)
+            if isinstance(hops, (int, float)) and isinstance(data.get("to"), str) and isinstance(data.get("from"), str):
+                origin = data["from"]
+                neigh = data["to"]
+                coerced = {
+                    "proto": data.get("proto", "lsr"),
+                    "type": "info",
+                    "from": origin,
+                    "to": "broadcast",
+                    "ttl": int(data.get("ttl", 8)),
+                    "headers": data.get("headers", []),
+                    "payload": {str(neigh): float(hops)},
+                }
+                if "msg_id" in data:
+                    coerced["msg_id"] = data["msg_id"]
+                if "trace_id" in data:
+                    coerced["trace_id"] = data["trace_id"]
+                return coerced
+
         return data
 
     async def _run(self) -> None:
         async for raw in self.transport.read_loop():
             if self._stopping.is_set():
                 break
-
             try:
                 data = json.loads(raw)
             except Exception:
                 self.log.warning(f"Descartado (JSON inválido): {raw[:120]}…")
                 continue
 
-            # ── Parche de compatibilidad antes de validar con el schema ──
             try:
                 data = self._coerce_compat(data)
             except Exception as e:
@@ -161,24 +153,20 @@ class ForwardingService:
     # ---------------- Dispatch por tipo ----------------
 
     async def _handle_packet(self, pkt: BasePacket) -> None:
-        # de-dupe por msg_id
         if pkt.msg_id and self.state.is_seen(pkt.msg_id):
             self.log.debug(f"VISTO (de-dupe) {pkt.type} id={pkt.msg_id}")
             return
         if pkt.msg_id:
             self.state.mark_seen(pkt.msg_id)
 
-        # anti-ciclo
         if pkt.seen_cycle(self.my_id):
             self.log.debug(f"CICLO detectado: {pkt.type} trace={pkt.trace_id}")
             return
 
-        # TTL
         if pkt.ttl <= 0 and pkt.type in ("info", "message"):
             self.log.debug(f"TTL=0 descartado: {pkt.type} id={pkt.msg_id}")
             return
 
-        # derivar
         if isinstance(pkt, HelloPacket):
             await self._on_hello(pkt)
         elif isinstance(pkt, InfoPacket):
@@ -195,7 +183,6 @@ class ForwardingService:
         self.log.info(f"[HELLO] de {pkt.from_} (trace={pkt.trace_id})")
 
     async def _on_info(self, pkt: InfoPacket) -> None:
-        # Solo si hay callback (LSR/DVR); flood de control en otros modos se ignora
         if self.on_info_async is None:
             self.log.debug("INFO recibido pero sin servicio de ruteo (ignorado)")
             return
@@ -206,7 +193,6 @@ class ForwardingService:
         except Exception as e:
             self.log.error(f"Error en on_info_async: {e}")
 
-        # Retransmitir a vecinos (excepto prev_hop)
         pkt_out = pkt.with_decremented_ttl().with_appended_hop(self.my_id)
         if pkt_out.ttl <= 0:
             return
@@ -220,7 +206,6 @@ class ForwardingService:
             self._deliver(pkt)
             return
 
-        # Flooding puro → siempre flooding
         if self.mode == "flooding":
             prev_hop: Optional[str] = pkt.headers[-1] if pkt.headers else None
             pkt_out = pkt.with_decremented_ttl().with_appended_hop(self.my_id)
@@ -229,7 +214,6 @@ class ForwardingService:
                 self.log.info(f"⇉ {pkt.from_} → {dst} (flooding) trace={pkt.trace_id}")
             return
 
-        # Para lsr/dvr/dijkstra: intentar ruteo, fallback a flooding
         next_hop = await self.state.get_next_hop(dst)
         if next_hop:
             ch = self.neighbor_map.get(next_hop)
@@ -240,7 +224,6 @@ class ForwardingService:
                     self.log.info(f"[MSG] {pkt.from_}→{dst} via {next_hop} trace={pkt.trace_id}")
                     return
 
-        # Sin ruta → flooding controlado
         prev_hop: Optional[str] = pkt.headers[-1] if pkt.headers else None
         pkt_out = pkt.with_decremented_ttl().with_appended_hop(self.my_id)
         if pkt_out.ttl > 0:
